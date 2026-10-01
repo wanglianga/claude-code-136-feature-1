@@ -442,7 +442,8 @@ func (s *Service) RemoveMember(ctx context.Context, passID, memberID, operator s
 	return nil
 }
 
-// UpdateMemberPhoto 更新成员人脸照片（孩子长大照片变化），版本号递增
+// UpdateMemberPhoto 更新成员人脸照片（孩子长大，版本+1）：旧照归档并标记失效时间，
+// 同时发布入口缓存同步事件（在线闸机立即追拉，离线闸机恢复后补拉）。
 func (s *Service) UpdateMemberPhoto(ctx context.Context, passID, memberID, photoURL, operator string) (*model.Member, error) {
 	if photoURL == "" {
 		return nil, fmt.Errorf("%w: photo_url required", ErrInvalidInput)
@@ -451,12 +452,32 @@ func (s *Service) UpdateMemberPhoto(ctx context.Context, passID, memberID, photo
 	if err := s.St.GetJSON(ctx, keyMember(memberID), &m); err != nil || m.PassID != passID {
 		return nil, ErrNotFound
 	}
+	p, err := s.getPass(ctx, passID)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	oldURL, oldVersion := m.PhotoURL, m.PhotoVersion
+
+	// 旧照归档（标记失效时间，供稽核回溯）
+	archID, _ := s.St.NextID(ctx, "parchive", "AR")
+	arch := model.PhotoArchive{
+		ID: archID, PassID: passID, MemberID: memberID, MemberName: m.Name,
+		PhotoURL: oldURL, PhotoVersion: oldVersion, EffectiveFrom: m.CreatedAt,
+		InvalidAt: now, TaskID: "", ArchivedAt: now, ArchivedBy: operator,
+	}
+	_ = s.St.SetJSON(ctx, keyPhotoArchive(archID), &arch)
+	s.St.R.LPush(ctx, keyMemberArchives(memberID), archID)
+
 	m.PhotoURL = photoURL
 	m.PhotoVersion++
+	m.PhotoUpdatedAt = now
 	if err := s.St.SetJSON(ctx, keyMember(memberID), &m); err != nil {
 		return nil, err
 	}
-	s.addChangeLog(ctx, passID, "UPDATE_PHOTO", fmt.Sprintf("成员 %s 更新人脸照片（v%d）", m.Name, m.PhotoVersion), operator)
+	ev := s.publishPhotoSync(ctx, p, &m, oldURL, now, "")
+	s.addChangeLog(ctx, passID, "UPDATE_PHOTO",
+		fmt.Sprintf("成员 %s 更新人脸照片（v%d→v%d），旧照归档并标记失效，缓存同步事件 #%d", m.Name, oldVersion, m.PhotoVersion, ev.Version), operator)
 	return &m, nil
 }
 

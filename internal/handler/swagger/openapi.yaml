@@ -1,0 +1,1020 @@
+openapi: 3.0.3
+info:
+  title: passgate 景区年卡核验服务 API
+  version: "1.0"
+  description: >
+    景区年卡实名入园、同行权益与异常核验后端。
+
+
+    本期新增：**儿童照片变化复核**。亲子年卡绑定儿童在 30 天内多次人脸相似度不足（阈值 3 次）时，
+    服务自动生成照片更新任务；家长可在现场或小程序提交新照片；工作人员核验**证件、监护关系、历史入园记录**
+    三项后旧照归档（标记失效时间）、新照生效并发布各入口缓存同步事件；复核期间年卡可走人工通道，
+    每次放行均记录操作人与原因；离线闸机恢复后按版本追拉照片缓存。
+
+
+    系统不设登录鉴权（演示），操作人通过请求头 `X-Operator` 或请求体 `operator` 字段标识。
+servers:
+  - url: /
+    description: 本机
+tags:
+  - name: Health
+  - name: Pass
+    description: 年卡生命周期
+  - name: Verify
+    description: 闸机入园核验与人工通道
+  - name: PhotoRecheck
+    description: 儿童照片变化复核
+  - name: Device
+    description: 闸机设备与照片缓存同步
+  - name: Reservation
+  - name: Appeal
+  - name: Admin
+  - name: Catalog
+
+paths:
+  /healthz:
+    get:
+      tags: [Health]
+      summary: 健康检查
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string, example: ok}
+
+  /api/passes:
+    post:
+      tags: [Pass]
+      summary: 购卡（实名+人脸+证件+成员，按售卖规则快照发卡；一证一卡）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreatePassInput"
+      responses:
+        "200":
+          description: 购卡成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PassViewEnvelope"
+        "409": { $ref: "#/components/responses/Error" }
+    get:
+      tags: [Pass]
+      summary: 按手机号查卡
+      parameters:
+        - {name: phone, in: query, required: true, schema: {type: string}}
+      responses:
+        "200":
+          description: 年卡列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: {$ref: "#/components/schemas/PassView"}
+
+  /api/passes/{id}:
+    get:
+      tags: [Pass]
+      summary: 年卡详情（实时剩余额度、成员、二维码）
+      parameters: [{ $ref: "#/components/parameters/PassId" }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/PassViewEnvelope"}
+        "404": { $ref: "#/components/responses/Error" }
+
+  /api/passes/{id}/freeze:
+    post:
+      tags: [Pass]
+      summary: 冻结年卡（不影响已预约未入园订单）
+      parameters: [{ $ref: "#/components/parameters/PassId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: {type: string}
+                operator: {type: string}
+      responses:
+        "200": {description: OK}
+        "409": { $ref: "#/components/responses/Error" }
+
+  /api/passes/{id}/unfreeze:
+    post:
+      tags: [Pass]
+      summary: 解冻年卡
+      parameters: [{ $ref: "#/components/parameters/PassId" }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: {operator: {type: string}}
+      responses:
+        "200": {description: OK}
+
+  /api/passes/{id}/refund:
+    post:
+      tags: [Pass]
+      summary: 退款（剩余有效期 ×80% 折算，权益清零，未用预约取消）
+      parameters: [{ $ref: "#/components/parameters/PassId" }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: {operator: {type: string}}
+      responses:
+        "200": {description: OK}
+
+  /api/passes/{id}/upgrade:
+    post:
+      tags: [Pass]
+      summary: 升级年卡（补差价，有效期与额度按新卡重算）
+      parameters: [{ $ref: "#/components/parameters/PassId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to_type]
+              properties:
+                to_type: {$ref: "#/components/schemas/PassType"}
+                operator: {type: string}
+      responses:
+        "200": {description: OK}
+
+  /api/passes/{id}/phone:
+    post:
+      tags: [Pass]
+      summary: 换绑手机号（演示验证码 123456）
+      parameters: [{ $ref: "#/components/parameters/PassId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [old_phone, new_phone, code]
+              properties:
+                old_phone: {type: string}
+                new_phone: {type: string}
+                code: {type: string, example: "123456"}
+                operator: {type: string}
+      responses:
+        "200": {description: OK}
+        "403": { $ref: "#/components/responses/Error" }
+
+  /api/passes/{id}/members:
+    post:
+      tags: [Pass]
+      summary: 添加同行成员（消耗一次成员更换额度）
+      parameters: [{ $ref: "#/components/parameters/PassId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - {$ref: "#/components/schemas/MemberInput"}
+                - type: object
+                  properties: {operator: {type: string}}
+      responses:
+        "200": {description: OK}
+        "409": { $ref: "#/components/responses/Error" }
+
+  /api/passes/{id}/members/{mid}:
+    delete:
+      tags: [Pass]
+      summary: 移除同行成员
+      parameters: [{ $ref: "#/components/parameters/PassId" }, { $ref: "#/components/parameters/MemberId" }]
+      responses:
+        "200": {description: OK}
+        "404": { $ref: "#/components/responses/Error" }
+
+  /api/passes/{id}/members/{mid}/photo:
+    post:
+      tags: [Pass]
+      summary: 直接更新成员人脸照片（旧照归档+标记失效+发布缓存同步事件）
+      parameters: [{ $ref: "#/components/parameters/PassId" }, { $ref: "#/components/parameters/MemberId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [photo_url]
+              properties:
+                photo_url: {type: string}
+                operator: {type: string}
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {data: {$ref: "#/components/schemas/Member"}}
+
+  /api/passes/{id}/members/{mid}/face-exempt:
+    post:
+      tags: [Pass]
+      summary: 标记/取消成员免刷脸（老人无法刷脸）
+      parameters: [{ $ref: "#/components/parameters/PassId" }, { $ref: "#/components/parameters/MemberId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                exempt: {type: boolean}
+                operator: {type: string}
+      responses:
+        "200": {description: OK}
+
+  /api/passes/{id}/members/{mid}/photo-recheck-task:
+    post:
+      tags: [PhotoRecheck]
+      summary: 工作人员手工为儿童创建照片更新任务（通常由闸机多次人脸不足自动创建）
+      parameters: [{ $ref: "#/components/parameters/PassId" }, { $ref: "#/components/parameters/MemberId" }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: {operator: {type: string, example: staff-chen}}
+      responses:
+        "200":
+          description: 已创建（仅允许 child 成员；已有打开任务返回 409）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {data: {$ref: "#/components/schemas/PhotoUpdateTask"}}
+        "400": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+
+  /api/passes/{id}/members/{mid}/photo-archives:
+    get:
+      tags: [PhotoRecheck]
+      summary: 成员历史照片归档（旧照片 URL / 版本 / 失效时间）
+      parameters: [{ $ref: "#/components/parameters/PassId" }, { $ref: "#/components/parameters/MemberId" }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: {$ref: "#/components/schemas/PhotoArchive"}
+
+  /api/passes/{id}/qr-refresh:
+    post:
+      tags: [Pass]
+      summary: 刷新二维码（旧码立即失效）
+      parameters: [{ $ref: "#/components/parameters/PassId" }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: {operator: {type: string}}
+      responses:
+        "200": {description: OK}
+
+  /api/passes/{id}/changes:
+    get:
+      tags: [Pass]
+      summary: 年卡变更日志
+      parameters: [{ $ref: "#/components/parameters/PassId" }]
+      responses:
+        "200": {description: OK}
+
+  /api/passes/{id}/verifications:
+    get:
+      tags: [Verify]
+      summary: 年卡核验历史
+      parameters: [{ $ref: "#/components/parameters/PassId" }]
+      responses:
+        "200": {description: OK}
+
+  /api/passes/{id}/reservations:
+    get:
+      tags: [Reservation]
+      summary: 年卡预约列表
+      parameters: [{ $ref: "#/components/parameters/PassId" }]
+      responses:
+        "200": {description: OK}
+
+  /api/passes/{id}/gate-logs:
+    get:
+      tags: [Verify]
+      summary: 年卡闸机流水
+      parameters: [{ $ref: "#/components/parameters/PassId" }]
+      responses:
+        "200": {description: OK}
+
+  /api/verify:
+    post:
+      tags: [Verify]
+      summary: 闸机核验
+      description: >
+        返回 ALLOW / MANUAL_REVIEW / QUOTA_INSUFFICIENT / SUSPECTED_LENDING 与原因码。
+
+
+        当儿童主入园人在窗口内多次人脸不足时，原因码为 `PHOTO_RECHECK_REVIEW` 并返回 `photo_task_id`；
+        复核期间即使人脸分数足够也转人工通道。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/VerifyRequest"}
+      responses:
+        "200":
+          description: 核验结论
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {data: {$ref: "#/components/schemas/VerifyResult"}}
+
+  /api/verifications/{vid}:
+    get:
+      tags: [Verify]
+      summary: 核验详情（失败原因 + 人工处理链路）
+      parameters: [{ $ref: "#/components/parameters/VerifId" }]
+      responses:
+        "200": {description: OK}
+        "404": { $ref: "#/components/responses/Error" }
+
+  /api/verifications/{vid}/manual-review:
+    post:
+      tags: [Verify]
+      summary: 人工放行/拒绝（必须填操作人与说明；照片复核期放行额外记录放行原因）
+      parameters: [{ $ref: "#/components/parameters/VerifId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action, operator, note]
+              properties:
+                action: {type: string, enum: [RELEASE, REJECT]}
+                operator: {type: string, example: staff-chen}
+                note: {type: string}
+                reason:
+                  type: string
+                  description: 照片复核期人工通道放行原因
+                  example: FACE_CHANGED_DURING_RECHECK
+      responses:
+        "200": {description: OK}
+        "409": { $ref: "#/components/responses/Error" }
+
+  /api/exit:
+    post:
+      tags: [Verify]
+      summary: 出园，释放在园容量
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pass_id, attraction]
+              properties:
+                pass_id: {type: string}
+                attraction: {type: string}
+                count: {type: integer, default: 1}
+                device_id: {type: string}
+      responses:
+        "200": {description: OK}
+
+  /api/photo-tasks:
+    get:
+      tags: [PhotoRecheck]
+      summary: 照片更新任务列表（可按状态 / 年卡过滤）
+      parameters:
+        - {name: status, in: query, schema: {$ref: "#/components/schemas/PhotoTaskStatus"}}
+        - {name: pass_id, in: query, schema: {type: string}}
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: {$ref: "#/components/schemas/PhotoUpdateTask"}
+
+  /api/photo-tasks/{tid}:
+    get:
+      tags: [PhotoRecheck]
+      summary: 照片更新任务详情（含复核期间每次人工放行留痕）
+      parameters: [{ $ref: "#/components/parameters/TaskId" }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {$ref: "#/components/schemas/PhotoUpdateTask"}
+                  manual_releases:
+                    type: array
+                    items: {$ref: "#/components/schemas/PhotoRecheckRelease"}
+        "404": { $ref: "#/components/responses/Error" }
+
+  /api/photo-tasks/{tid}/submit:
+    post:
+      tags: [PhotoRecheck]
+      summary: 家长提交新照片（现场 ONSITE / 小程序 MINIAPP），任务进入待核验
+      parameters: [{ $ref: "#/components/parameters/TaskId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [new_photo_url, channel]
+              properties:
+                new_photo_url: {type: string}
+                channel: {type: string, enum: [ONSITE, MINIAPP]}
+                operator: {type: string, description: 现场为工作人员，小程序为家长标识}
+      responses:
+        "200": {description: OK}
+        "409": { $ref: "#/components/responses/Error" }
+
+  /api/photo-tasks/{tid}/review:
+    post:
+      tags: [PhotoRecheck]
+      summary: 工作人员核验（证件/监护关系/历史入园三项全过才批准：旧照归档、新照生效、发布同步事件）
+      parameters: [{ $ref: "#/components/parameters/TaskId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [approve, operator, note]
+              properties:
+                approve: {type: boolean}
+                id_checked: {type: boolean, description: 证件核验}
+                guardian_checked: {type: boolean, description: 监护关系核验}
+                history_checked: {type: boolean, description: 历史入园记录核验}
+                note: {type: string}
+                operator: {type: string, example: staff-chen}
+      responses:
+        "200":
+          description: 核验完成
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {data: {$ref: "#/components/schemas/PhotoUpdateTask"}}
+        "400": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+
+  /api/devices:
+    get:
+      tags: [Device]
+      summary: 设备列表（含在线状态）
+      responses:
+        "200": {description: OK}
+    post:
+      tags: [Device]
+      summary: 注册闸机设备
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/Device"}
+      responses:
+        "200": {description: OK}
+
+  /api/devices/{id}/heartbeat:
+    post:
+      tags: [Device]
+      summary: 设备心跳
+      parameters: [{ $ref: "#/components/parameters/DeviceId" }]
+      responses:
+        "200": {description: OK}
+        "404": { $ref: "#/components/responses/Error" }
+
+  /api/devices/{id}/photo-sync:
+    get:
+      tags: [Device]
+      summary: 闸机增量拉取照片变更（在线轮询；离线恢复后带最后 ACK 版本追拉）
+      parameters:
+        - { $ref: "#/components/parameters/DeviceId" }
+        - {name: after, in: query, schema: {type: integer, format: int64, default: 0},
+           description: 本地已应用的最大版本号，返回该版本之后的事件}
+      responses:
+        "200":
+          description: 增量事件
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  current_version: {type: integer, format: int64}
+                  data:
+                    type: array
+                    items: {$ref: "#/components/schemas/PhotoSyncEvent"}
+
+  /api/devices/{id}/photo-sync/ack:
+    post:
+      tags: [Device]
+      summary: 闸机确认本地照片缓存已更新到某版本
+      parameters: [{ $ref: "#/components/parameters/DeviceId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [version]
+              properties:
+                version: {type: integer, format: int64}
+      responses:
+        "200": {description: OK}
+        "409": { $ref: "#/components/responses/Error" }
+
+  /api/devices/photo-sync/status:
+    get:
+      tags: [Device]
+      summary: 各入口设备照片缓存同步状态（已 ACK 版本 / 待同步事件数）
+      responses:
+        "200": {description: OK}
+
+  /api/reservations:
+    post:
+      tags: [Reservation]
+      summary: 创建预约（冻结卡不可新预约）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pass_id, attraction, date]
+              properties:
+                pass_id: {type: string}
+                attraction: {type: string}
+                date: {type: string, example: "2026-10-01"}
+                slot: {type: string}
+      responses:
+        "200": {description: OK}
+
+  /api/reservations/{id}/cancel:
+    post:
+      tags: [Reservation]
+      summary: 取消预约
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "200": {description: OK}
+
+  /api/appeals:
+    get:
+      tags: [Appeal]
+      summary: 申诉列表
+      parameters:
+        - {name: status, in: query, schema: {type: string, enum: [PENDING, APPROVED, REJECTED]}}
+      responses:
+        "200": {description: OK}
+    post:
+      tags: [Appeal]
+      summary: 游客申诉
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pass_id, description]
+              properties:
+                pass_id: {type: string}
+                verification_id: {type: string}
+                type: {type: string, enum: [WRONG_DEDUCTION, VERIFY_FAIL, FREEZE_DISPUTE, OTHER]}
+                description: {type: string}
+      responses:
+        "200": {description: OK}
+
+  /api/appeals/{id}/resolve:
+    post:
+      tags: [Appeal]
+      summary: 客服处理申诉（通过可自动返还误扣额度）
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [approve, resolution, handler]
+              properties:
+                approve: {type: boolean}
+                resolution: {type: string}
+                compensate_quota: {type: integer}
+                handler: {type: string, example: cs-wang}
+      responses:
+        "200": {description: OK}
+
+  /api/attractions:
+    get:
+      tags: [Catalog]
+      summary: 景点列表
+      responses:
+        "200": {description: OK}
+    post:
+      tags: [Catalog]
+      summary: 新增景点（容量）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/Attraction"}
+      responses:
+        "200": {description: OK}
+
+  /api/attractions/{id}/capacity:
+    get:
+      tags: [Catalog]
+      summary: 景点当前在园人数
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+        - {name: date, in: query, schema: {type: string}}
+      responses:
+        "200": {description: OK}
+
+  /api/holidays:
+    get:
+      tags: [Catalog]
+      summary: 节假日列表
+      responses:
+        "200": {description: OK}
+
+  /api/admin/sales-rules:
+    get:
+      tags: [Admin]
+      summary: 售卖规则
+      responses:
+        "200": {description: OK}
+
+  /api/admin/sales-rules/{type}:
+    put:
+      tags: [Admin]
+      summary: 调整售卖规则（仅影响新售卡）
+      parameters:
+        - name: type
+          in: path
+          required: true
+          schema: {$ref: "#/components/schemas/PassType"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/SalesRule"}
+      responses:
+        "200": {description: OK}
+
+  /api/admin/stats/overview:
+    get:
+      tags: [Admin]
+      summary: 运营总览（售卖/使用率/异常/人工放行）
+      parameters:
+        - {name: date, in: query, schema: {type: string}}
+      responses:
+        "200": {description: OK}
+
+  /api/admin/stats/peaks:
+    get:
+      tags: [Admin]
+      summary: 入园峰值（按小时/景点）
+      parameters:
+        - {name: date, in: query, schema: {type: string}}
+      responses:
+        "200": {description: OK}
+
+  /api/admin/gate-logs:
+    get:
+      tags: [Admin]
+      summary: 全量闸机流水
+      parameters:
+        - {name: limit, in: query, schema: {type: integer, default: 100}}
+      responses:
+        "200": {description: OK}
+
+components:
+  parameters:
+    PassId:
+      name: id
+      in: path
+      required: true
+      schema: {type: string}
+    MemberId:
+      name: mid
+      in: path
+      required: true
+      schema: {type: string}
+    VerifId:
+      name: vid
+      in: path
+      required: true
+      schema: {type: string}
+    TaskId:
+      name: tid
+      in: path
+      required: true
+      schema: {type: string}
+    DeviceId:
+      name: id
+      in: path
+      required: true
+      schema: {type: string}
+  responses:
+    Error:
+      description: 业务错误
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: object
+                properties:
+                  message: {type: string}
+  schemas:
+    PassType:
+      type: string
+      enum: [single, family, parent_child]
+    PassTypeRef:
+      $ref: "#/components/schemas/PassType"
+    MemberInput:
+      type: object
+      required: [name, id_card]
+      properties:
+        name: {type: string}
+        id_card: {type: string}
+        id_card_expiry: {type: string}
+        relation: {type: string, enum: [self, spouse, child, parent, other]}
+        photo_url: {type: string}
+        face_exempt: {type: boolean}
+    CreatePassInput:
+      type: object
+      required: [type, holder_name, holder_id_card, id_card_expiry, phone]
+      properties:
+        type: {$ref: "#/components/schemas/PassType"}
+        holder_name: {type: string}
+        holder_id_card: {type: string}
+        id_card_expiry: {type: string}
+        phone: {type: string}
+        photo_url: {type: string}
+        members:
+          type: array
+          items: {$ref: "#/components/schemas/MemberInput"}
+    Member:
+      type: object
+      properties:
+        id: {type: string}
+        pass_id: {type: string}
+        name: {type: string}
+        id_card: {type: string}
+        id_card_expiry: {type: string}
+        role: {type: string, enum: [holder, companion]}
+        relation: {type: string, enum: [self, spouse, child, parent, other]}
+        photo_url: {type: string}
+        photo_version: {type: integer}
+        photo_updated_at: {type: string, format: date-time}
+        face_exempt: {type: boolean}
+    PassView:
+      type: object
+      properties:
+        id: {type: string}
+        type: {$ref: "#/components/schemas/PassType"}
+        status: {type: string, enum: [active, frozen, refunded]}
+        holder_name: {type: string}
+        holder_id_card: {type: string}
+        phone: {type: string}
+        valid_from: {type: string}
+        valid_until: {type: string}
+        total_quota: {type: integer}
+        companion_limit: {type: integer}
+        attractions:
+          type: array
+          items: {type: string}
+        holiday_blocked: {type: boolean}
+        allowed_slots:
+          type: array
+          items: {type: string}
+        member_change_left: {type: integer}
+        paid_amount: {type: number}
+        remaining_quota: {type: integer}
+        used_quota: {type: integer}
+        qr_token: {type: string}
+        members:
+          type: array
+          items: {$ref: "#/components/schemas/Member"}
+    PassViewEnvelope:
+      type: object
+      properties:
+        data: {$ref: "#/components/schemas/PassView"}
+    VerifyRequest:
+      type: object
+      required: [request_id, device_id, attraction]
+      properties:
+        request_id: {type: string, description: 闸机幂等键，重试保持不变}
+        device_id: {type: string}
+        pass_id: {type: string}
+        qr_token: {type: string}
+        id_card: {type: string}
+        face_score: {type: number, description: "0-100；-1 未采集到人脸"}
+        photo_clear: {type: boolean}
+        companions:
+          type: array
+          items: {type: string}
+        attraction: {type: string}
+        timestamp: {type: string, format: date-time}
+        offline_sync: {type: boolean}
+    VerifyResult:
+      type: object
+      properties:
+        verification_id: {type: string}
+        decision: {type: string, enum: [ALLOW, MANUAL_REVIEW, QUOTA_INSUFFICIENT, SUSPECTED_LENDING]}
+        reason:
+          type: string
+          enum:
+            - DEVICE_UNKNOWN
+            - DEVICE_OFFLINE
+            - PASS_NOT_FOUND
+            - PASS_FROZEN
+            - PASS_REFUNDED
+            - PASS_EXPIRED
+            - PASS_NOT_STARTED
+            - ATTRACTION_NOT_ALLOWED
+            - HOLIDAY_BLOCKED
+            - TIMESLOT_BLOCKED
+            - CAPACITY_FULL
+            - COMPANION_EXCEEDED
+            - COMPANION_NOT_BOUND
+            - FACE_MISMATCH
+            - FACE_EXEMPT_REVIEW
+            - PHOTO_RECHECK_REVIEW
+            - PHOTO_UNCLEAR
+            - ID_EXPIRED
+            - HIGH_FREQUENCY
+            - MULTI_LOCATION
+            - QUOTA_EXHAUSTED
+            - DUPLICATE_ENTRY
+        detail: {type: string}
+        charged_quota: {type: integer}
+        remaining_quota: {type: integer}
+        duplicate_of: {type: string}
+        member_id: {type: string}
+        photo_task_id: {type: string}
+    PhotoTaskStatus:
+      type: string
+      enum: [PENDING_SUBMISSION, PENDING_REVIEW, APPROVED, REJECTED, CANCELLED]
+    PhotoUpdateTask:
+      type: object
+      properties:
+        id: {type: string}
+        pass_id: {type: string}
+        member_id: {type: string}
+        member_name: {type: string}
+        pass_type: {$ref: "#/components/schemas/PassType"}
+        status: {$ref: "#/components/schemas/PhotoTaskStatus"}
+        source: {type: string, enum: [AUTO_GATE, MANUAL]}
+        trigger_device_id: {type: string}
+        trigger_verification_id: {type: string}
+        fail_count: {type: integer}
+        window_started_at: {type: string, format: date-time}
+        last_fail_at: {type: string, format: date-time}
+        new_photo_url: {type: string}
+        submitted_at: {type: string, format: date-time}
+        submit_channel: {type: string, enum: [ONSITE, MINIAPP]}
+        submit_operator: {type: string}
+        id_checked: {type: boolean}
+        guardian_checked: {type: boolean}
+        history_checked: {type: boolean}
+        history_entry_count: {type: integer}
+        review_operator: {type: string}
+        review_note: {type: string}
+        reviewed_at: {type: string, format: date-time}
+        archived_photo_id: {type: string}
+        old_photo_version: {type: integer}
+        new_photo_version: {type: integer}
+        approved_at: {type: string, format: date-time}
+        old_photo_invalid_at: {type: string, format: date-time}
+        sync_version: {type: integer, format: int64}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    PhotoArchive:
+      type: object
+      properties:
+        id: {type: string}
+        pass_id: {type: string}
+        member_id: {type: string}
+        member_name: {type: string}
+        photo_url: {type: string}
+        photo_version: {type: integer}
+        effective_from: {type: string, format: date-time}
+        invalid_at: {type: string, format: date-time}
+        task_id: {type: string}
+        archived_at: {type: string, format: date-time}
+        archived_by: {type: string}
+    PhotoRecheckRelease:
+      type: object
+      properties:
+        id: {type: string}
+        task_id: {type: string}
+        verification_id: {type: string}
+        pass_id: {type: string}
+        member_id: {type: string}
+        device_id: {type: string}
+        gate_id: {type: string}
+        attraction: {type: string}
+        operator: {type: string}
+        reason: {type: string, example: FACE_CHANGED_DURING_RECHECK}
+        note: {type: string}
+        created_at: {type: string, format: date-time}
+    PhotoSyncEvent:
+      type: object
+      properties:
+        version: {type: integer, format: int64}
+        pass_id: {type: string}
+        member_id: {type: string}
+        member_name: {type: string}
+        photo_url: {type: string}
+        photo_version: {type: integer}
+        old_photo_url: {type: string}
+        old_photo_invalid_at: {type: string, format: date-time}
+        task_id: {type: string}
+        type: {type: string, example: PHOTO_UPDATED}
+        created_at: {type: string, format: date-time}
+    Device:
+      type: object
+      properties:
+        id: {type: string}
+        name: {type: string}
+        gate_id: {type: string}
+        attraction: {type: string}
+        last_heartbeat: {type: string, format: date-time}
+        registered_at: {type: string, format: date-time}
+    Attraction:
+      type: object
+      properties:
+        id: {type: string}
+        name: {type: string}
+        capacity: {type: integer}
+    SalesRule:
+      type: object
+      properties:
+        pass_type: {$ref: "#/components/schemas/PassType"}
+        price: {type: number}
+        total_quota: {type: integer}
+        companion_limit: {type: integer}
+        attractions:
+          type: array
+          items: {type: string}
+        holiday_blocked: {type: boolean}
+        allowed_slots:
+          type: array
+          items: {type: string}
+        valid_days: {type: integer}
+        member_change_limit: {type: integer}
+        on_sale: {type: boolean}
+        daily_limit: {type: integer}

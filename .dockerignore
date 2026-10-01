@@ -1,0 +1,6 @@
+passgate
+*.exe
+/tmp
+.git
+.DS_Store
+*.log

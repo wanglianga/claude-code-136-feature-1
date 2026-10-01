@@ -11,6 +11,8 @@ import (
 
 // Register 注册全部路由
 func Register(app *fiber.App, svc *service.Service) {
+	registerSwagger(app)
+
 	app.Get("/healthz", func(c *fiber.Ctx) error {
 		if err := svc.St.Ping(context.Background()); err != nil {
 			return c.Status(503).JSON(fiber.Map{"status": "redis_down"})
@@ -167,6 +169,53 @@ func Register(app *fiber.App, svc *service.Service) {
 		return respond(c, list, err)
 	})
 
+	// ---- 儿童照片变化复核 ----
+	api.Post("/passes/:id/members/:mid/photo-recheck-task", func(c *fiber.Ctx) error {
+		var body struct {
+			Operator string `json:"operator"`
+		}
+		_ = c.BodyParser(&body)
+		task, err := svc.CreatePhotoTaskManual(ctx(), c.Params("id"), c.Params("mid"), operator(c, body.Operator))
+		return respond(c, task, err)
+	})
+	api.Get("/passes/:id/members/:mid/photo-archives", func(c *fiber.Ctx) error {
+		list, err := svc.ListMemberPhotoArchives(ctx(), c.Params("id"), c.Params("mid"))
+		return respond(c, list, err)
+	})
+	api.Get("/photo-tasks", func(c *fiber.Ctx) error {
+		list, err := svc.ListPhotoTasks(ctx(), c.Query("status"), c.Query("pass_id"))
+		return respond(c, list, err)
+	})
+	api.Get("/photo-tasks/:tid", func(c *fiber.Ctx) error {
+		task, releases, err := svc.GetPhotoTask(ctx(), c.Params("tid"))
+		if err != nil {
+			return respond(c, nil, err)
+		}
+		return c.JSON(fiber.Map{"data": task, "manual_releases": releases})
+	})
+	api.Post("/photo-tasks/:tid/submit", func(c *fiber.Ctx) error {
+		var in service.SubmitPhotoInput
+		if err := c.BodyParser(&in); err != nil {
+			return fail(ErrBadRequest)
+		}
+		if in.Operator == "" {
+			in.Operator = operator(c, "")
+		}
+		task, err := svc.SubmitTaskPhoto(ctx(), c.Params("tid"), in)
+		return respond(c, task, err)
+	})
+	api.Post("/photo-tasks/:tid/review", func(c *fiber.Ctx) error {
+		var in service.ReviewPhotoInput
+		if err := c.BodyParser(&in); err != nil {
+			return fail(ErrBadRequest)
+		}
+		if in.Operator == "" {
+			in.Operator = operator(c, "")
+		}
+		task, err := svc.ReviewTaskPhoto(ctx(), c.Params("tid"), in)
+		return respond(c, task, err)
+	})
+
 	// ---- 核验 ----
 	api.Post("/verify", func(c *fiber.Ctx) error {
 		var req service.VerifyRequest
@@ -217,6 +266,31 @@ func Register(app *fiber.App, svc *service.Service) {
 	api.Get("/devices", func(c *fiber.Ctx) error {
 		list, err := svc.ListDevices(ctx())
 		return respond(c, list, err)
+	})
+	// 闸机照片缓存：增量拉取 / 确认更新（在线轮询；离线恢复后带最后 ACK 版本追拉）
+	api.Get("/devices/:id/photo-sync", func(c *fiber.Ctx) error {
+		after := int64(c.QueryInt("after", 0))
+		current, events, err := svc.PullPhotoSync(ctx(), c.Params("id"), after)
+		if err != nil {
+			return respond(c, nil, err)
+		}
+		return c.JSON(fiber.Map{"data": events, "current_version": current})
+	})
+	api.Post("/devices/:id/photo-sync/ack", func(c *fiber.Ctx) error {
+		var body struct {
+			Version int64 `json:"version"`
+		}
+		if err := c.BodyParser(&body); err != nil {
+			return fail(ErrBadRequest)
+		}
+		if err := svc.AckPhotoSync(ctx(), c.Params("id"), body.Version); err != nil {
+			return respond(c, nil, err)
+		}
+		return respond(c, fiber.Map{"ok": true, "acked_version": body.Version}, nil)
+	})
+	api.Get("/devices/photo-sync/status", func(c *fiber.Ctx) error {
+		list, err := svc.ListDeviceSyncStatus(ctx())
+		return respond(c, fiber.Map{"current_version": svc.PhotoSyncCurrent(ctx()), "devices": list}, err)
 	})
 
 	// ---- 预约 ----

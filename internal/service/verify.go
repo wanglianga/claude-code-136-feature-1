@@ -34,6 +34,8 @@ type VerifyResult struct {
 	ChargedQuota   int            `json:"charged_quota"`
 	RemainingQuota int            `json:"remaining_quota"`
 	DuplicateOf    string         `json:"duplicate_of,omitempty"`
+	MemberID       string         `json:"member_id,omitempty"`
+	PhotoTaskID    string         `json:"photo_task_id,omitempty"`
 }
 
 // runCharge 执行原子扣减脚本，返回 {code, charged, extra}
@@ -208,6 +210,9 @@ func (s *Service) Verify(ctx context.Context, req VerifyRequest) (*VerifyResult,
 				"证件 "+req.IDCard+" 未绑定为该年卡成员"), nil
 		}
 	}
+	if principal != nil {
+		v.MemberID = principal.ID
+	}
 	// 同行人须为已绑定成员，且不含主入园人本人
 	companions := make([]string, 0, len(req.Companions))
 	for _, c := range req.Companions {
@@ -243,7 +248,38 @@ func (s *Service) Verify(ctx context.Context, req VerifyRequest) (*VerifyResult,
 		return s.finish(ctx, v, p, model.DecisionManual, model.ReasonPhotoUnclear,
 			"现场采集照片不清晰，无法完成人脸比对"), nil
 	}
+	// 儿童照片变化复核：该成员存在打开中的复核任务时，复核期间统一转人工通道，
+	// 人工放行每次留痕（操作人 + 原因），直到新照片核验生效
+	if principal != nil {
+		if tid, err := s.St.R.Get(ctx, keyMemberOpenTask(principal.ID)).Result(); err == nil && tid != "" {
+			var task model.PhotoUpdateTask
+			if err := s.St.GetJSON(ctx, keyPhotoTask(tid), &task); err == nil && isOpenPhotoTask(task.Status) {
+				v.PhotoTaskID = task.ID
+				return s.finish(ctx, v, p, model.DecisionManual, model.ReasonPhotoRecheck,
+					fmt.Sprintf("成员 %s 照片变化复核中（任务 %s，状态 %s），请走人工通道；每次放行将记录操作人与原因",
+						principal.Name, task.ID, task.Status)), nil
+			}
+			s.St.R.Del(ctx, keyMemberOpenTask(principal.ID))
+		}
+	}
 	if req.FaceScore < FacePassScore {
+		// 儿童随成长面部变化较大：窗口内多次相似度不足 → 服务自动生成照片更新任务
+		if principal != nil && principal.Relation == "child" {
+			if task := s.registerChildFaceMismatch(ctx, p, principal, req.DeviceID, verifID, ts); task != nil {
+				v.PhotoTaskID = task.ID
+				return s.finish(ctx, v, p, model.DecisionManual, model.ReasonPhotoRecheck,
+					fmt.Sprintf("儿童 %s %d 天内已 %d 次人脸相似度不足，已生成照片更新任务 %s；复核期间请走人工通道，家长可在现场或小程序提交新照片",
+						principal.Name, int(FaceRecheckWindow.Hours()/24), task.FailCount, task.ID)), nil
+			}
+			var fs faceFailState
+			_ = s.St.GetJSON(ctx, keyFaceFail(principal.ID), &fs)
+			if fs.Count > 0 {
+				return s.finish(ctx, v, p, model.DecisionManual, model.ReasonFaceMismatch,
+					fmt.Sprintf("人脸比对得分 %.1f 低于阈值 %.0f；儿童 %s 近 %d 天已 %d 次相似度不足，再 %d 次将生成照片更新任务",
+						req.FaceScore, FacePassScore, principal.Name, int(FaceRecheckWindow.Hours()/24),
+						fs.Count, FaceRecheckThreshold-fs.Count)), nil
+			}
+		}
 		return s.finish(ctx, v, p, model.DecisionManual, model.ReasonFaceMismatch,
 			fmt.Sprintf("人脸比对得分 %.1f 低于阈值 %.0f", req.FaceScore, FacePassScore)), nil
 	}
@@ -332,6 +368,7 @@ func (s *Service) resultOf(ctx context.Context, v *model.Verification) *VerifyRe
 	return &VerifyResult{
 		VerificationID: v.ID, Decision: v.Decision, Reason: v.Reason, Detail: v.Detail,
 		ChargedQuota: v.ChargedQuota, RemainingQuota: remaining, DuplicateOf: v.DuplicateOf,
+		MemberID: v.MemberID, PhotoTaskID: v.PhotoTaskID,
 	}
 }
 
@@ -401,6 +438,7 @@ type ManualReviewInput struct {
 	Action   string `json:"action"`   // RELEASE | REJECT
 	Operator string `json:"operator"` // 工作人员
 	Note     string `json:"note"`     // 处理说明（必填，客服解释依据）
+	Reason   string `json:"reason"`   // 放行原因（照片复核期人工通道默认 FACE_CHANGED_DURING_RECHECK）
 }
 
 // ManualReview 现场人工处理：放行走同一原子扣减路径，全程留痕
@@ -460,6 +498,13 @@ func (s *Service) ManualReview(ctx context.Context, verifID string, in ManualRev
 		}
 		s.statIncr(ctx, "stats:manual:"+date, 1)
 		s.writeGateLog(ctx, v, "MANUAL_RELEASE", in.Operator)
+		// 儿童照片复核期间的人工放行：每次都记录操作人与放行原因，可在复核任务中追溯
+		if v.PhotoTaskID != "" {
+			var task model.PhotoUpdateTask
+			if err := s.St.GetJSON(ctx, keyPhotoTask(v.PhotoTaskID), &task); err == nil && isOpenPhotoTask(task.Status) {
+				s.recordRecheckRelease(ctx, &task, v, in.Operator, in.Reason, in.Note)
+			}
+		}
 	} else {
 		v.ManualAction = "REJECTED"
 		v.Detail += fmt.Sprintf("；人工拒绝 by %s：%s", in.Operator, in.Note)
