@@ -1,0 +1,635 @@
+openapi: 3.0.3
+info:
+  title: passgate 景区年卡实名入园核验服务
+  version: 1.1.0
+  description: >
+    景区年卡核验后端：年卡生命周期、闸机入园核验（人脸/证件/二维码/同行人/容量）、
+    人工放行留痕、申诉返还、运营统计，以及**儿童照片变化复核**
+    （闸机多次相似度不足自动生成照片更新任务 → 家长现场/小程序提交 → 工作人员核验证件/监护关系/
+    历史入园记录 → 旧照片归档（含失效时间）→ 新照片生效并同步各入口缓存；
+    复核期间可走人工通道，每次放行记录操作人与原因；离线闸机恢复后拉取缓存更新）。
+
+    所有响应统一包裹为 `{"data": ...}`；错误为 `{"error": {"message": "..."}}`。
+    操作人通过请求体 `operator` 或请求头 `X-Operator` 标识。
+servers:
+  - url: http://127.0.0.1:8080
+    description: 本地开发
+tags:
+  - name: 核验
+  - name: 年卡
+  - name: 儿童照片变化复核
+  - name: 设备与照片缓存
+  - name: 预约
+  - name: 申诉
+  - name: 基础数据
+  - name: 运营
+
+paths:
+  /healthz:
+    get:
+      tags: [基础数据]
+      summary: 健康检查
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object } } } }
+
+  /api/verify:
+    post:
+      tags: [核验]
+      summary: 闸机核验
+      description: >
+        返回 ALLOW / MANUAL_REVIEW / QUOTA_INSUFFICIENT / SUSPECTED_LENDING 与原因码。
+        request_id 为幂等键。主入园人 FACE_MISMATCH 达到阈值且为儿童时，
+        自动生成照片更新任务（verification 中返回 photo_review_task_id）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/VerifyRequest" }
+      responses:
+        "200":
+          description: 核验结论
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/VerifyResult" }
+
+  /api/verifications/{id}:
+    get:
+      tags: [核验]
+      summary: 核验详情（含人工处理链路）
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/verifications/{id}/manual-review:
+    post:
+      tags: [核验]
+      summary: 人工放行/拒绝（必须填操作人与说明）
+      description: 若该核验关联照片复核任务，会同时写入复核期人工通道留痕。
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ManualReviewInput" }
+      responses:
+        "200": { description: OK }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/exit:
+    post:
+      tags: [核验]
+      summary: 出园，释放在园容量
+      responses:
+        "200": { description: OK }
+
+  /api/passes:
+    get:
+      tags: [年卡]
+      summary: 按手机号查卡
+      parameters:
+        - { in: query, name: phone, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+    post:
+      tags: [年卡]
+      summary: 购卡（实名+人脸照片+成员，按售卖规则快照发卡）
+      responses:
+        "200": { description: OK }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/passes/{id}:
+    get:
+      tags: [年卡]
+      summary: 年卡详情（实时额度、成员、二维码）
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/PassView" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/passes/{id}/freeze:
+    post: { tags: [年卡], summary: 冻结（不影响已预约订单）, responses: { "200": { description: OK } } }
+  /api/passes/{id}/unfreeze:
+    post: { tags: [年卡], summary: 解冻, responses: { "200": { description: OK } } }
+  /api/passes/{id}/refund:
+    post: { tags: [年卡], summary: 退款折算并清零权益, responses: { "200": { description: OK } } }
+  /api/passes/{id}/upgrade:
+    post: { tags: [年卡], summary: 升级并按新卡重算有效期/额度, responses: { "200": { description: OK } } }
+  /api/passes/{id}/phone:
+    post: { tags: [年卡], summary: 换绑手机号（演示验证码 123456）, responses: { "200": { description: OK } } }
+  /api/passes/{id}/qr-refresh:
+    post: { tags: [年卡], summary: 刷新二维码（旧码失效）, responses: { "200": { description: OK } } }
+  /api/passes/{id}/changes:
+    get: { tags: [年卡], summary: 变更日志（敏感操作留痕）, responses: { "200": { description: OK } } }
+  /api/passes/{id}/verifications:
+    get: { tags: [年卡], summary: 核验历史, responses: { "200": { description: OK } } }
+  /api/passes/{id}/reservations:
+    get: { tags: [年卡], summary: 预约列表, responses: { "200": { description: OK } } }
+  /api/passes/{id}/gate-logs:
+    get: { tags: [年卡], summary: 闸机流水, responses: { "200": { description: OK } } }
+  /api/passes/{id}/manual-passes:
+    get:
+      tags: [年卡]
+      summary: 照片复核期人工通道放行记录（每次放行的操作人与原因）
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/ManualPassRecord" }
+
+  /api/passes/{id}/members:
+    post: { tags: [年卡], summary: 添加同行成员（消耗更换次数）, responses: { "200": { description: OK } } }
+  /api/passes/{id}/members/{mid}:
+    delete: { tags: [年卡], summary: 移除同行成员, responses: { "200": { description: OK } } }
+  /api/passes/{id}/members/{mid}/photo:
+    post: { tags: [年卡], summary: 直接更新成员照片（版本+1）, responses: { "200": { description: OK } } }
+  /api/passes/{id}/members/{mid}/face-exempt:
+    post: { tags: [年卡], summary: 老人免刷脸标记, responses: { "200": { description: OK } } }
+  /api/passes/{id}/members/{mid}/photo-archives:
+    get:
+      tags: [年卡]
+      summary: 成员旧照片归档列表（含旧照片失效时间与复核依据）
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+        - { in: path, name: mid, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/PhotoArchive" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/photo-reviews:
+    get:
+      tags: [儿童照片变化复核]
+      summary: 复核任务列表
+      parameters:
+        - { in: query, name: status, required: false, schema: { type: string, enum: [PENDING_SUBMISSION, SUBMITTED, APPROVED, REJECTED] } }
+        - { in: query, name: pass_id, required: false, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/PhotoReviewTask" }
+    post:
+      tags: [儿童照片变化复核]
+      summary: 家长/现场主动发起照片更新任务
+      description: 闸机多次低分也会由服务自动生成（source=AUTO_GATE_LOW_SCORE），无需调用本接口。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pass_id, member_id]
+              properties:
+                pass_id: { type: string }
+                member_id: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/PhotoReviewTask" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/photo-reviews/{id}:
+    get:
+      tags: [儿童照片变化复核]
+      summary: 复核任务详情
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/PhotoReviewTask" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/photo-reviews/{id}/submit:
+    post:
+      tags: [儿童照片变化复核]
+      summary: 家长提交新照片（现场或小程序）
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SubmitPhotoReviewInput" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/PhotoReviewTask" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/photo-reviews/{id}/review:
+    post:
+      tags: [儿童照片变化复核]
+      summary: 工作人员复核（证件 + 监护关系 + 历史入园记录）
+      description: >
+        三项核验必须全部确认。approve=true：旧照片归档（记录失效时间）、新照片版本+1生效、
+        向各入口设备下发缓存；approve=false：驳回并关闭任务。
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReviewPhotoReviewInput" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/PhotoReviewTask" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/photo-reviews/{id}/manual-pass:
+    post:
+      tags: [儿童照片变化复核]
+      summary: 复核期间人工通道放行（每次放行记录操作人与原因）
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ManualPassInput" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/ManualPassRecord" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/photo-reviews/{id}/manual-passes:
+    get:
+      tags: [儿童照片变化复核]
+      summary: 该复核任务下的人工通道放行记录
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/ManualPassRecord" }
+
+  /api/devices:
+    get: { tags: [设备与照片缓存], summary: 设备列表（含在线状态）, responses: { "200": { description: OK } } }
+    post: { tags: [设备与照片缓存], summary: 注册闸机, responses: { "200": { description: OK } } }
+  /api/devices/{id}/heartbeat:
+    post:
+      tags: [设备与照片缓存]
+      summary: 设备心跳（响应携带 pending_photo_updates）
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      ok: { type: boolean }
+                      pending_photo_updates: { type: integer, format: int64 }
+  /api/devices/{id}/photo-cache/pull:
+    post:
+      tags: [设备与照片缓存]
+      summary: 闸机拉取待更新照片缓存（离线恢复后同样调用）
+      description: 拉取后该设备标记为已同步，并顺带刷新心跳（重新上线）。
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      device_id: { type: string }
+                      updated_count: { type: integer }
+                      photo_versions:
+                        type: array
+                        items: { $ref: "#/components/schemas/PhotoCacheVersion" }
+  /api/devices/photo-sync:
+    get:
+      tags: [设备与照片缓存]
+      summary: 各入口照片缓存同步总览
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/PhotoSyncOverview" }
+
+  /api/reservations:
+    post: { tags: [预约], summary: 预约, responses: { "200": { description: OK } } }
+  /api/reservations/{id}/cancel:
+    post: { tags: [预约], summary: 取消预约, responses: { "200": { description: OK } } }
+
+  /api/appeals:
+    get: { tags: [申诉], summary: 申诉列表（可按状态）, responses: { "200": { description: OK } } }
+    post: { tags: [申诉], summary: 提交申诉, responses: { "200": { description: OK } } }
+  /api/appeals/{id}/resolve:
+    post: { tags: [申诉], summary: 客服处理（通过可返还额度）, responses: { "200": { description: OK } } }
+
+  /api/attractions:
+    get: { tags: [基础数据], summary: 景点列表, responses: { "200": { description: OK } } }
+    post: { tags: [基础数据], summary: 新增景点, responses: { "200": { description: OK } } }
+  /api/attractions/{id}/capacity:
+    get: { tags: [基础数据], summary: 景点当前在园人数, responses: { "200": { description: OK } } }
+  /api/holidays:
+    get: { tags: [基础数据], summary: 节假日列表, responses: { "200": { description: OK } } }
+    put: { tags: [基础数据], summary: 设置节假日, responses: { "200": { description: OK } } }
+
+  /api/admin/sales-rules:
+    get: { tags: [运营], summary: 售卖规则, responses: { "200": { description: OK } } }
+  /api/admin/sales-rules/{type}:
+    put: { tags: [运营], summary: 调整售卖规则（仅影响新卡）, responses: { "200": { description: OK } } }
+  /api/admin/stats/overview:
+    get: { tags: [运营], summary: 运营总览, responses: { "200": { description: OK } } }
+  /api/admin/stats/peaks:
+    get: { tags: [运营], summary: 入园峰值, responses: { "200": { description: OK } } }
+  /api/admin/gate-logs:
+    get: { tags: [运营], summary: 闸机流水查询, responses: { "200": { description: OK } } }
+
+components:
+  responses:
+    NotFound:
+      description: 资源不存在
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    BadRequest:
+      description: 请求参数错误（如三项核验未全部确认、放行原因为空）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Conflict:
+      description: 状态冲突（如已有进行中复核、重复处理）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            message: { type: string }
+    VerifyRequest:
+      type: object
+      required: [device_id, attraction]
+      properties:
+        request_id: { type: string, description: 闸机幂等键，重试不变 }
+        device_id: { type: string, example: dev-east-01 }
+        pass_id: { type: string }
+        qr_token: { type: string }
+        id_card: { type: string, description: 主入园人证件（刷证件时） }
+        face_score: { type: number, example: 88.5 }
+        photo_clear: { type: boolean }
+        companions: { type: array, items: { type: string } }
+        attraction: { type: string, example: attr-lake }
+        timestamp: { type: string, format: date-time }
+        offline_sync: { type: boolean }
+    VerifyResult:
+      type: object
+      properties:
+        verification_id: { type: string }
+        decision: { type: string, enum: [ALLOW, MANUAL_REVIEW, QUOTA_INSUFFICIENT, SUSPECTED_LENDING] }
+        reason: { type: string, example: FACE_MISMATCH }
+        detail: { type: string }
+        charged_quota: { type: integer }
+        remaining_quota: { type: integer }
+        duplicate_of: { type: string }
+    ManualReviewInput:
+      type: object
+      required: [action, note]
+      properties:
+        action: { type: string, enum: [RELEASE, REJECT] }
+        operator: { type: string, example: staff-chen }
+        note: { type: string }
+    Member:
+      type: object
+      properties:
+        id: { type: string }
+        pass_id: { type: string }
+        name: { type: string }
+        id_card: { type: string }
+        id_card_expiry: { type: string }
+        role: { type: string, enum: [holder, companion] }
+        relation: { type: string, enum: [self, spouse, child, parent, other] }
+        photo_url: { type: string }
+        photo_version: { type: integer }
+        photo_updated_at: { type: string, format: date-time }
+        face_exempt: { type: boolean }
+    PassView:
+      allOf:
+        - type: object
+          properties:
+            id: { type: string }
+            type: { type: string, enum: [single, family, parent_child] }
+            status: { type: string, enum: [active, frozen, refunded] }
+            holder_name: { type: string }
+            phone: { type: string }
+            valid_from: { type: string }
+            valid_until: { type: string }
+            total_quota: { type: integer }
+            companion_limit: { type: integer }
+        - type: object
+          properties:
+            remaining_quota: { type: integer }
+            used_quota: { type: integer }
+            qr_token: { type: string }
+            members:
+              type: array
+              items: { $ref: "#/components/schemas/Member" }
+    PhotoReviewTask:
+      type: object
+      properties:
+        id: { type: string, example: PR000001 }
+        pass_id: { type: string }
+        member_id: { type: string }
+        member_name: { type: string }
+        child_id_card: { type: string }
+        status: { type: string, enum: [PENDING_SUBMISSION, SUBMITTED, APPROVED, REJECTED] }
+        source: { type: string, enum: [AUTO_GATE_LOW_SCORE, MANUAL_REQUEST] }
+        low_score_count: { type: integer }
+        trigger_verification_ids: { type: array, items: { type: string } }
+        new_photo_url: { type: string }
+        submit_channel: { type: string, enum: [ONSITE, MINIAPP] }
+        submitted_by: { type: string }
+        id_verified: { type: boolean }
+        guardianship_check: { type: string, example: VERIFIED }
+        entry_history_check: { type: string, example: VERIFIED }
+        entry_history_matched: { type: integer }
+        reviewed_by: { type: string }
+        review_note: { type: string }
+        archive_id: { type: string }
+        old_version: { type: integer }
+        new_version: { type: integer }
+        old_photo_expires_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    SubmitPhotoReviewInput:
+      type: object
+      required: [new_photo_url]
+      properties:
+        new_photo_url: { type: string }
+        channel: { type: string, enum: [ONSITE, MINIAPP], default: MINIAPP }
+        note: { type: string }
+        submitted_by: { type: string, description: 家长标识/手机号 }
+    ReviewPhotoReviewInput:
+      type: object
+      required: [approve, note]
+      properties:
+        approve: { type: boolean }
+        id_verified: { type: boolean, description: 已核验证件（户口本/身份证） }
+        guardianship_check: { type: string, enum: [VERIFIED] }
+        entry_history_check: { type: string, enum: [VERIFIED] }
+        note: { type: string }
+        operator: { type: string, example: staff-chen }
+    ManualPassInput:
+      type: object
+      required: [device_id, reason]
+      properties:
+        device_id: { type: string }
+        attraction: { type: string, description: 默认取设备所属景点 }
+        reason: { type: string, description: 放行原因（必填）, example: 儿童面部变化待照片复核 }
+        note: { type: string }
+        people: { type: integer, description: 放行人次（含儿童），默认 1 }
+        verification_id: { type: string }
+        operator: { type: string, example: staff-chen }
+    ManualPassRecord:
+      type: object
+      properties:
+        id: { type: string }
+        pass_id: { type: string }
+        member_id: { type: string }
+        member_name: { type: string }
+        review_task_id: { type: string }
+        device_id: { type: string }
+        gate_id: { type: string }
+        attraction: { type: string }
+        verification_id: { type: string }
+        reason: { type: string }
+        operator: { type: string }
+        note: { type: string }
+        charged_quota: { type: integer }
+        created_at: { type: string, format: date-time }
+    PhotoArchive:
+      type: object
+      properties:
+        id: { type: string }
+        member_id: { type: string }
+        pass_id: { type: string }
+        name: { type: string }
+        old_photo_url: { type: string }
+        old_version: { type: integer }
+        reason: { type: string, example: PHOTO_REVIEW_APPROVED }
+        review_task_id: { type: string }
+        archived_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time, description: 旧照片失效时间 }
+        id_verified: { type: boolean }
+        guardianship_check: { type: string }
+        entry_history_check: { type: string }
+        operator: { type: string }
+        note: { type: string }
+    PhotoCacheVersion:
+      type: object
+      properties:
+        member_id: { type: string }
+        pass_id: { type: string }
+        name: { type: string }
+        photo_url: { type: string }
+        photo_version: { type: integer }
+        updated_at: { type: string, format: date-time }
+        old_expires_at: { type: string, format: date-time, description: 闸机据此丢弃本地旧版照片 }
+    DevicePhotoSyncView:
+      type: object
+      properties:
+        device_id: { type: string }
+        online: { type: boolean }
+        pending_count: { type: integer, format: int64 }
+        synced_versions: { type: integer, format: int64 }
+        last_pull_at: { type: string, format: date-time }
+    PhotoSyncOverview:
+      type: object
+      properties:
+        current_versions: { type: integer, format: int64 }
+        devices:
+          type: array
+          items: { $ref: "#/components/schemas/DevicePhotoSyncView" }

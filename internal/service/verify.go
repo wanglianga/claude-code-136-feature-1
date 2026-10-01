@@ -27,13 +27,14 @@ type VerifyRequest struct {
 
 // VerifyResult 核验响应
 type VerifyResult struct {
-	VerificationID string         `json:"verification_id"`
-	Decision       model.Decision `json:"decision"`
-	Reason         string         `json:"reason"`
-	Detail         string         `json:"detail"`
-	ChargedQuota   int            `json:"charged_quota"`
-	RemainingQuota int            `json:"remaining_quota"`
-	DuplicateOf    string         `json:"duplicate_of,omitempty"`
+	VerificationID    string         `json:"verification_id"`
+	Decision          model.Decision `json:"decision"`
+	Reason            string         `json:"reason"`
+	Detail            string         `json:"detail"`
+	ChargedQuota      int            `json:"charged_quota"`
+	RemainingQuota    int            `json:"remaining_quota"`
+	DuplicateOf       string         `json:"duplicate_of,omitempty"`
+	PhotoReviewTaskID string         `json:"photo_review_task_id,omitempty"` // 低分触发/关联的照片更新任务
 }
 
 // runCharge 执行原子扣减脚本，返回 {code, charged, extra}
@@ -208,6 +209,10 @@ func (s *Service) Verify(ctx context.Context, req VerifyRequest) (*VerifyResult,
 				"证件 "+req.IDCard+" 未绑定为该年卡成员"), nil
 		}
 	}
+	if principal != nil {
+		v.PrincipalMemberID = principal.ID
+		v.PrincipalName = principal.Name
+	}
 	// 同行人须为已绑定成员，且不含主入园人本人
 	companions := make([]string, 0, len(req.Companions))
 	for _, c := range req.Companions {
@@ -244,8 +249,14 @@ func (s *Service) Verify(ctx context.Context, req VerifyRequest) (*VerifyResult,
 			"现场采集照片不清晰，无法完成人脸比对"), nil
 	}
 	if req.FaceScore < FacePassScore {
-		return s.finish(ctx, v, p, model.DecisionManual, model.ReasonFaceMismatch,
-			fmt.Sprintf("人脸比对得分 %.1f 低于阈值 %.0f", req.FaceScore, FacePassScore)), nil
+		// 多次相似度不足时，服务自动生成儿童照片更新任务
+		taskID := s.NoteFaceMismatch(ctx, v, principal)
+		detail := fmt.Sprintf("人脸比对得分 %.1f 低于阈值 %.0f", req.FaceScore, FacePassScore)
+		if taskID != "" {
+			v.PhotoReviewTaskID = taskID
+			detail += fmt.Sprintf("；已生成照片更新任务 %s，复核期间可走人工通道（每次放行记录操作人与原因）", taskID)
+		}
+		return s.finish(ctx, v, p, model.DecisionManual, model.ReasonFaceMismatch, detail), nil
 	}
 
 	// 9) 放行去重快速路径：同一游客同一景点在去重窗口内已放行 → 视为同一次入园
@@ -313,7 +324,11 @@ func (s *Service) finish(ctx context.Context, v *model.Verification, p *model.Pa
 	if decision == model.DecisionAllow {
 		action = "ALLOW"
 	}
-	s.writeGateLog(ctx, v, action, "")
+	note := ""
+	if v.PhotoReviewTaskID != "" {
+		note = "照片复核任务 " + v.PhotoReviewTaskID + " 待处理，可走人工通道"
+	}
+	s.writeGateLog(ctx, v, action, "", note)
 	if decision != model.DecisionAllow {
 		pt := model.PassType("")
 		if p != nil {
@@ -332,15 +347,18 @@ func (s *Service) resultOf(ctx context.Context, v *model.Verification) *VerifyRe
 	return &VerifyResult{
 		VerificationID: v.ID, Decision: v.Decision, Reason: v.Reason, Detail: v.Detail,
 		ChargedQuota: v.ChargedQuota, RemainingQuota: remaining, DuplicateOf: v.DuplicateOf,
+		PhotoReviewTaskID: v.PhotoReviewTaskID,
 	}
 }
 
-func (s *Service) writeGateLog(ctx context.Context, v *model.Verification, action, operator string) {
+func (s *Service) writeGateLog(ctx context.Context, v *model.Verification, action, operator, note string) {
 	id, _ := s.St.NextID(ctx, "glog", "G")
 	gl := model.GateLog{
-		ID: id, VerificationID: v.ID, PassID: v.PassID, DeviceID: v.DeviceID, GateID: v.GateID,
+		ID: id, VerificationID: v.ID, PassID: v.PassID,
+		MemberID: v.PrincipalMemberID, MemberName: v.PrincipalName,
+		DeviceID: v.DeviceID, GateID: v.GateID,
 		Attraction: v.Attraction, Direction: "ENTRY", Action: action, Reason: v.Reason,
-		QuotaCharged: v.ChargedQuota, Operator: operator, CreatedAt: time.Now(),
+		Note: note, QuotaCharged: v.ChargedQuota, Operator: operator, CreatedAt: time.Now(),
 	}
 	_ = s.St.SetJSON(ctx, keyGateLog(id), &gl)
 	s.St.R.LPush(ctx, keyGateLogList(), id)
@@ -459,7 +477,15 @@ func (s *Service) ManualReview(ctx context.Context, verifID string, in ManualRev
 			s.recordEntryStats(ctx, date, v.CreatedAt.Hour(), p.Type, v.Attraction, mr.ChargedQuota)
 		}
 		s.statIncr(ctx, "stats:manual:"+date, 1)
-		s.writeGateLog(ctx, v, "MANUAL_RELEASE", in.Operator)
+		s.writeGateLog(ctx, v, "MANUAL_RELEASE", in.Operator, in.Note)
+		// 关联儿童照片复核任务的放行：同时记入复核期人工通道留痕（每次放行记录操作人与原因）
+		if v.PhotoReviewTaskID != "" {
+			s.attachReviewManualPass(ctx, v, v.PhotoReviewTaskID, in.Operator, in.Note, mr.ChargedQuota)
+		} else if v.PrincipalMemberID != "" {
+			if openID := s.OpenPhotoReviewID(ctx, v.PrincipalMemberID); openID != "" && v.Reason == model.ReasonFaceMismatch {
+				s.attachReviewManualPass(ctx, v, openID, in.Operator, in.Note, mr.ChargedQuota)
+			}
+		}
 	} else {
 		v.ManualAction = "REJECTED"
 		v.Detail += fmt.Sprintf("；人工拒绝 by %s：%s", in.Operator, in.Note)

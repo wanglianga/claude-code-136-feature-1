@@ -451,8 +451,10 @@ func (s *Service) UpdateMemberPhoto(ctx context.Context, passID, memberID, photo
 	if err := s.St.GetJSON(ctx, keyMember(memberID), &m); err != nil || m.PassID != passID {
 		return nil, ErrNotFound
 	}
+	now := time.Now()
 	m.PhotoURL = photoURL
 	m.PhotoVersion++
+	m.PhotoUpdatedAt = &now
 	if err := s.St.SetJSON(ctx, keyMember(memberID), &m); err != nil {
 		return nil, err
 	}

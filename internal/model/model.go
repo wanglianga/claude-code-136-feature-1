@@ -58,17 +58,38 @@ const (
 
 // Member 年卡成员（持卡人 + 同行成员）
 type Member struct {
+	ID             string     `json:"id"`
+	PassID         string     `json:"pass_id"`
+	Name           string     `json:"name"`
+	IDCard         string     `json:"id_card"`
+	IDCardExpiry   string     `json:"id_card_expiry"` // YYYY-MM-DD
+	Role           string     `json:"role"`           // holder | companion
+	Relation       string     `json:"relation"`       // self | spouse | child | parent | other
+	PhotoURL       string     `json:"photo_url"`
+	PhotoVersion   int        `json:"photo_version"`
+	PhotoUpdatedAt *time.Time `json:"photo_updated_at,omitempty"` // 当前照片拍摄/生效时间
+	FaceExempt     bool       `json:"face_exempt"`                // 老人等无法刷脸成员
+	CreatedAt      time.Time  `json:"created_at"`
+}
+
+// PhotoArchive 旧照片归档（保留可追溯：照片地址、版本、归档原因、核验依据）
+type PhotoArchive struct {
 	ID           string    `json:"id"`
+	MemberID     string    `json:"member_id"`
 	PassID       string    `json:"pass_id"`
 	Name         string    `json:"name"`
-	IDCard       string    `json:"id_card"`
-	IDCardExpiry string    `json:"id_card_expiry"` // YYYY-MM-DD
-	Role         string    `json:"role"`           // holder | companion
-	Relation     string    `json:"relation"`       // self | spouse | child | parent | other
-	PhotoURL     string    `json:"photo_url"`
-	PhotoVersion int       `json:"photo_version"`
-	FaceExempt   bool      `json:"face_exempt"` // 老人等无法刷脸成员
-	CreatedAt    time.Time `json:"created_at"`
+	OldPhotoURL  string    `json:"old_photo_url"`
+	OldVersion   int       `json:"old_version"`
+	Reason       string    `json:"reason"` // PHOTO_REVIEW_APPROVED | MANUAL_UPDATE
+	ReviewTaskID string    `json:"review_task_id,omitempty"`
+	ArchivedAt   time.Time `json:"archived_at"`
+	ExpiresAt    time.Time `json:"expires_at"` // 旧照片失效时间（之后各入口不得再用于比对）
+	// 工作人员复核三项依据
+	IDVerified        bool   `json:"id_verified"`
+	GuardianshipCheck string `json:"guardianship_check"`  // VERIFIED
+	EntryHistoryCheck string `json:"entry_history_check"` // VERIFIED
+	Operator          string `json:"operator"`
+	Note              string `json:"note"`
 }
 
 // Pass 年卡
@@ -108,24 +129,27 @@ type PassView struct {
 
 // Verification 一次闸机核验记录（无论成败均落库，客服可查）
 type Verification struct {
-	ID           string    `json:"id"`
-	RequestID    string    `json:"request_id"` // 闸机侧幂等键
-	PassID       string    `json:"pass_id"`
-	PassType     string    `json:"pass_type"`
-	HolderName   string    `json:"holder_name"`
-	DeviceID     string    `json:"device_id"`
-	GateID       string    `json:"gate_id"`
-	Attraction   string    `json:"attraction"`
-	Decision     Decision  `json:"decision"`
-	Reason       string    `json:"reason"`
-	Detail       string    `json:"detail"` // 人类可读说明，客服解释用
-	FaceScore    float64   `json:"face_score"`
-	Companions   []string  `json:"companions"`
-	ChargedQuota int       `json:"charged_quota"`
-	DuplicateOf  string    `json:"duplicate_of,omitempty"`
-	OfflineSync  bool      `json:"offline_sync"`
-	ManualAction string    `json:"manual_action,omitempty"` // RELEASED | REJECTED
-	CreatedAt    time.Time `json:"created_at"`
+	ID                string    `json:"id"`
+	RequestID         string    `json:"request_id"` // 闸机侧幂等键
+	PassID            string    `json:"pass_id"`
+	PassType          string    `json:"pass_type"`
+	HolderName        string    `json:"holder_name"`
+	PrincipalMemberID string    `json:"principal_member_id,omitempty"` // 本次实际刷脸/刷证件的成员
+	PrincipalName     string    `json:"principal_name,omitempty"`
+	DeviceID          string    `json:"device_id"`
+	GateID            string    `json:"gate_id"`
+	Attraction        string    `json:"attraction"`
+	Decision          Decision  `json:"decision"`
+	Reason            string    `json:"reason"`
+	Detail            string    `json:"detail"` // 人类可读说明，客服解释用
+	FaceScore         float64   `json:"face_score"`
+	Companions        []string  `json:"companions"`
+	ChargedQuota      int       `json:"charged_quota"`
+	DuplicateOf       string    `json:"duplicate_of,omitempty"`
+	OfflineSync       bool      `json:"offline_sync"`
+	ManualAction      string    `json:"manual_action,omitempty"`        // RELEASED | REJECTED
+	PhotoReviewTaskID string    `json:"photo_review_task_id,omitempty"` // 低分触发/关联的照片复核任务
+	CreatedAt         time.Time `json:"created_at"`
 }
 
 // ManualReview 现场人工处理记录（人工放行必须留痕，客服可解释）
@@ -145,12 +169,15 @@ type GateLog struct {
 	ID             string    `json:"id"`
 	VerificationID string    `json:"verification_id"`
 	PassID         string    `json:"pass_id"`
+	MemberID       string    `json:"member_id,omitempty"`
+	MemberName     string    `json:"member_name,omitempty"`
 	DeviceID       string    `json:"device_id"`
 	GateID         string    `json:"gate_id"`
 	Attraction     string    `json:"attraction"`
 	Direction      string    `json:"direction"` // ENTRY | EXIT
-	Action         string    `json:"action"`    // ALLOW | DENY | MANUAL_RELEASE | EXIT
+	Action         string    `json:"action"`    // ALLOW | DENY | MANUAL_RELEASE | MANUAL_PASS | EXIT
 	Reason         string    `json:"reason"`
+	Note           string    `json:"note,omitempty"` // 人工通道放行原因（照片复核期间必须填写）
 	QuotaCharged   int       `json:"quota_charged"`
 	Operator       string    `json:"operator,omitempty"`
 	CreatedAt      time.Time `json:"created_at"`
@@ -224,4 +251,94 @@ type ChangeLog struct {
 	Detail    string    `json:"detail"`
 	Operator  string    `json:"operator"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+// ---------- 儿童照片变化复核 ----------
+
+// 照片复核任务状态
+const (
+	PhotoReviewPending   = "PENDING_SUBMISSION" // 服务自动生成，等待家长提交新照片
+	PhotoReviewSubmitted = "SUBMITTED"          // 家长已提交，等待工作人员核验
+	PhotoReviewApproved  = "APPROVED"           // 复核通过，新照片生效
+	PhotoReviewRejected  = "REJECTED"           // 复核驳回（人证/监护关系不符等）
+)
+
+// 照片复核任务来源
+const (
+	PhotoReviewSourceAuto   = "AUTO_GATE_LOW_SCORE" // 闸机多次低分自动生成
+	PhotoReviewSourceManual = "MANUAL_REQUEST"      // 家长/现场主动发起
+)
+
+// PhotoReviewTask 儿童照片变化复核任务
+type PhotoReviewTask struct {
+	ID          string `json:"id"`
+	PassID      string `json:"pass_id"`
+	MemberID    string `json:"member_id"`
+	MemberName  string `json:"member_name"`
+	ChildIDCard string `json:"child_id_card"`
+	Status      string `json:"status"`
+	Source      string `json:"source"`
+	// 触发证据：闸机多次相似度不足
+	LowScoreCount int       `json:"low_score_count"`
+	TriggerVerifs []string  `json:"trigger_verification_ids"`
+	FirstLowAt    time.Time `json:"first_low_score_at"`
+	// 家长提交
+	NewPhotoURL   string     `json:"new_photo_url,omitempty"`
+	SubmitChannel string     `json:"submit_channel,omitempty"` // ONSITE | MINIAPP
+	SubmitNote    string     `json:"submit_note,omitempty"`
+	SubmittedBy   string     `json:"submitted_by,omitempty"`
+	SubmittedAt   *time.Time `json:"submitted_at,omitempty"`
+	// 工作人员复核：证件 + 监护关系 + 历史入园记录
+	IDVerified          bool       `json:"id_verified"`
+	GuardianshipCheck   string     `json:"guardianship_check,omitempty"` // VERIFIED
+	EntryHistoryCheck   string     `json:"entry_history_check,omitempty"`
+	EntryHistoryMatched int        `json:"entry_history_matched,omitempty"` // 近 180 天历史入园次数
+	ReviewNote          string     `json:"review_note,omitempty"`
+	ReviewedBy          string     `json:"reviewed_by,omitempty"`
+	ReviewedAt          *time.Time `json:"reviewed_at,omitempty"`
+	// 复核结果
+	ArchiveID    string     `json:"archive_id,omitempty"`
+	OldVersion   int        `json:"old_version,omitempty"`
+	NewVersion   int        `json:"new_version,omitempty"`
+	OldExpiresAt *time.Time `json:"old_photo_expires_at,omitempty"` // 旧照片失效时间
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
+}
+
+// ManualPassRecord 照片复核期间人工通道放行记录（每次放行均记录操作人与原因）
+type ManualPassRecord struct {
+	ID             string    `json:"id"`
+	PassID         string    `json:"pass_id"`
+	MemberID       string    `json:"member_id"`
+	MemberName     string    `json:"member_name"`
+	ReviewTaskID   string    `json:"review_task_id"`
+	DeviceID       string    `json:"device_id"`
+	GateID         string    `json:"gate_id"`
+	Attraction     string    `json:"attraction"`
+	VerificationID string    `json:"verification_id,omitempty"`
+	Reason         string    `json:"reason"` // 放行原因（必填）
+	Operator       string    `json:"operator"`
+	Note           string    `json:"note"`
+	ChargedQuota   int       `json:"charged_quota"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
+// PhotoCacheVersion 入口照片缓存中的成员照片版本（审批生效后下发）
+type PhotoCacheVersion struct {
+	MemberID     string    `json:"member_id"`
+	PassID       string    `json:"pass_id"`
+	Name         string    `json:"name"`
+	PhotoURL     string    `json:"photo_url"`
+	PhotoVersion int       `json:"photo_version"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	OldExpiresAt time.Time `json:"old_expires_at"` // 旧照片失效时间，闸机据此丢弃本地旧版
+}
+
+// DevicePhotoSyncView 单台入口设备的照片缓存同步状态
+type DevicePhotoSyncView struct {
+	DeviceID       string     `json:"device_id"`
+	Online         bool       `json:"online"`
+	PendingCount   int64      `json:"pending_count"` // 待同步（已生效但该设备未确认）
+	SyncedVersions int64      `json:"synced_versions"`
+	LastPullAt     *time.Time `json:"last_pull_at,omitempty"`
 }

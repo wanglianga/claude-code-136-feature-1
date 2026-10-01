@@ -3,14 +3,18 @@ package handler
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"github.com/gofiber/fiber/v2"
+	"passgate/docs"
 	"passgate/internal/model"
 	"passgate/internal/service"
 )
 
 // Register 注册全部路由
 func Register(app *fiber.App, svc *service.Service) {
+	registerDocs(app)
+
 	app.Get("/healthz", func(c *fiber.Ctx) error {
 		if err := svc.St.Ping(context.Background()); err != nil {
 			return c.Status(503).JSON(fiber.Map{"status": "redis_down"})
@@ -142,6 +146,10 @@ func Register(app *fiber.App, svc *service.Service) {
 		m, err := svc.SetFaceExempt(ctx(), c.Params("id"), c.Params("mid"), body.Exempt, operator(c, body.Operator))
 		return respond(c, m, err)
 	})
+	api.Get("/passes/:id/members/:mid/photo-archives", func(c *fiber.Ctx) error {
+		list, err := svc.ListMemberPhotoArchives(ctx(), c.Params("id"), c.Params("mid"))
+		return respond(c, list, err)
+	})
 	api.Post("/passes/:id/qr-refresh", func(c *fiber.Ctx) error {
 		var body struct {
 			Operator string `json:"operator"`
@@ -164,6 +172,10 @@ func Register(app *fiber.App, svc *service.Service) {
 	})
 	api.Get("/passes/:id/gate-logs", func(c *fiber.Ctx) error {
 		list, err := svc.ListGateLogs(ctx(), c.Params("id"), 200)
+		return respond(c, list, err)
+	})
+	api.Get("/passes/:id/manual-passes", func(c *fiber.Ctx) error {
+		list, err := svc.ListPassManualPasses(ctx(), c.Params("id"))
 		return respond(c, list, err)
 	})
 
@@ -212,10 +224,89 @@ func Register(app *fiber.App, svc *service.Service) {
 		return respond(c, out, err)
 	})
 	api.Post("/devices/:id/heartbeat", func(c *fiber.Ctx) error {
-		return respond(c, fiber.Map{"ok": true}, svc.Heartbeat(ctx(), c.Params("id")))
+		if err := svc.Heartbeat(ctx(), c.Params("id")); err != nil {
+			return respond(c, nil, err)
+		}
+		// 心跳响应携带待同步照片版本数，提醒在线/恢复在线的闸机拉取
+		return c.JSON(fiber.Map{
+			"data": fiber.Map{
+				"ok":                    true,
+				"pending_photo_updates": svc.DevicePhotoPendingCount(ctx(), c.Params("id")),
+			},
+		})
 	})
 	api.Get("/devices", func(c *fiber.Ctx) error {
 		list, err := svc.ListDevices(ctx())
+		return respond(c, list, err)
+	})
+	api.Post("/devices/:id/photo-cache/pull", func(c *fiber.Ctx) error {
+		versions, err := svc.PullDevicePhotoCache(ctx(), c.Params("id"))
+		if err != nil {
+			return respond(c, nil, err)
+		}
+		return c.JSON(fiber.Map{"data": fiber.Map{
+			"device_id":      c.Params("id"),
+			"updated_count":  len(versions),
+			"photo_versions": versions,
+		}})
+	})
+	api.Get("/devices/photo-sync", func(c *fiber.Ctx) error {
+		o, err := svc.PhotoSyncOverview(ctx())
+		return respond(c, o, err)
+	})
+
+	// ---- 儿童照片变化复核 ----
+	api.Post("/photo-reviews", func(c *fiber.Ctx) error {
+		var body struct {
+			PassID   string `json:"pass_id"`
+			MemberID string `json:"member_id"`
+		}
+		if err := c.BodyParser(&body); err != nil || body.PassID == "" || body.MemberID == "" {
+			return fail(ErrBadRequest)
+		}
+		t, err := svc.CreatePhotoReviewManual(ctx(), body.PassID, body.MemberID)
+		return respond(c, t, err)
+	})
+	api.Get("/photo-reviews", func(c *fiber.Ctx) error {
+		list, err := svc.ListPhotoReviews(ctx(), c.Query("status"), c.Query("pass_id"))
+		return respond(c, list, err)
+	})
+	api.Get("/photo-reviews/:id", func(c *fiber.Ctx) error {
+		t, err := svc.GetPhotoReview(ctx(), c.Params("id"))
+		return respond(c, t, err)
+	})
+	api.Post("/photo-reviews/:id/submit", func(c *fiber.Ctx) error {
+		var in service.SubmitPhotoReviewInput
+		if err := c.BodyParser(&in); err != nil {
+			return fail(ErrBadRequest)
+		}
+		t, err := svc.SubmitPhotoReview(ctx(), c.Params("id"), in)
+		return respond(c, t, err)
+	})
+	api.Post("/photo-reviews/:id/review", func(c *fiber.Ctx) error {
+		var in service.ReviewPhotoReviewInput
+		if err := c.BodyParser(&in); err != nil {
+			return fail(ErrBadRequest)
+		}
+		if in.Operator == "" {
+			in.Operator = operator(c, "")
+		}
+		t, err := svc.ReviewPhotoReview(ctx(), c.Params("id"), in)
+		return respond(c, t, err)
+	})
+	api.Post("/photo-reviews/:id/manual-pass", func(c *fiber.Ctx) error {
+		var in service.ManualPassInput
+		if err := c.BodyParser(&in); err != nil {
+			return fail(ErrBadRequest)
+		}
+		if in.Operator == "" {
+			in.Operator = operator(c, "")
+		}
+		rec, err := svc.ManualPassDuringReview(ctx(), c.Params("id"), in)
+		return respond(c, rec, err)
+	})
+	api.Get("/photo-reviews/:id/manual-passes", func(c *fiber.Ctx) error {
+		list, err := svc.ListManualPasses(ctx(), c.Params("id"))
 		return respond(c, list, err)
 	})
 
@@ -336,6 +427,33 @@ func Register(app *fiber.App, svc *service.Service) {
 // ErrBadRequest 请求体错误
 var ErrBadRequest = errors.New("bad request body")
 
+// registerDocs 提供 OpenAPI 3.x 规范与 Swagger UI（静态资源内嵌，离线可用）
+// 仅注册 /docs（Fiber 默认 RedirectTrailingSlash 会把 /docs/ 收敛到 /docs）
+func registerDocs(app *fiber.App) {
+	serve := func(p string, ct string) fiber.Handler {
+		return func(c *fiber.Ctx) error {
+			c.Type(ct, "utf-8")
+			return c.SendStream(strings.NewReader(string(mustRead(p))))
+		}
+	}
+	app.Get("/docs", func(c *fiber.Ctx) error {
+		c.Type("html", "utf-8")
+		return c.SendStream(strings.NewReader(string(mustRead("index.html"))))
+	})
+	app.Get("/docs/openapi.yaml", serve("openapi.yaml", "application/yaml"))
+	app.Get("/docs/swagger-ui/swagger-ui.css", serve("swagger-ui/swagger-ui.css", "text/css"))
+	app.Get("/docs/swagger-ui/swagger-ui-bundle.js", serve("swagger-ui/swagger-ui-bundle.js", "application/javascript"))
+	app.Get("/docs/swagger-ui/swagger-ui-standalone-preset.js", serve("swagger-ui/swagger-ui-standalone-preset.js", "application/javascript"))
+}
+
+func mustRead(p string) []byte {
+	b, err := docs.FS.ReadFile(p)
+	if err != nil {
+		return []byte("// asset missing: " + p)
+	}
+	return b
+}
+
 func ctx() context.Context { return context.Background() }
 
 // operator 取操作人：body 优先，其次 X-Operator 头，默认 anonymous
@@ -370,7 +488,8 @@ func ErrorHandler(c *fiber.Ctx, err error) error {
 	switch {
 	case errors.Is(err, service.ErrNotFound):
 		code = fiber.StatusNotFound
-	case errors.Is(err, service.ErrInvalidInput), errors.Is(err, ErrBadRequest):
+	case errors.Is(err, service.ErrInvalidInput), errors.Is(err, ErrBadRequest),
+		errors.Is(err, service.ErrReviewCheckMissing), errors.Is(err, service.ErrReviewReasonEmpty):
 		code = fiber.StatusBadRequest
 	case errors.Is(err, service.ErrConflict),
 		errors.Is(err, service.ErrPassNotActive),
@@ -378,7 +497,9 @@ func ErrorHandler(c *fiber.Ctx, err error) error {
 		errors.Is(err, service.ErrAlreadyProcessed),
 		errors.Is(err, service.ErrDuplicateHolder),
 		errors.Is(err, service.ErrMemberChangeNone),
-		errors.Is(err, service.ErrQuotaInsufficient):
+		errors.Is(err, service.ErrQuotaInsufficient),
+		errors.Is(err, service.ErrReviewNotPending),
+		errors.Is(err, service.ErrReviewNotSubmitted):
 		code = fiber.StatusConflict
 	case errors.Is(err, service.ErrOffSale), errors.Is(err, service.ErrDailyLimit):
 		code = fiber.StatusConflict

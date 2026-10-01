@@ -21,22 +21,32 @@ const (
 	DeviceOfflineAfter = 60 * time.Second // 设备心跳超时判定离线
 	RefundRate         = 0.8              // 退款折算系数
 	VerifyCodeMock     = "123456"         // 演示环境模拟短信验证码
+
+	// 儿童照片变化复核
+	PhotoReviewLowScoreThreshold = 3                   // 连续低分（FACE_MISMATCH）达到该次数自动生成照片更新任务
+	PhotoReviewWindow            = 30 * 24 * time.Hour // 低分计数窗口
+	PhotoReviewOldPhotoTTL       = 7 * 24 * time.Hour  // 复核通过后旧照片保留/失效宽限期
+	PhotoReviewHistoryDays       = 180                 // 工作人员核查历史入园记录的回溯天数
 )
 
 // 业务错误（handler 映射为 4xx）
 var (
-	ErrNotFound          = errors.New("resource not found")
-	ErrInvalidInput      = errors.New("invalid input")
-	ErrConflict          = errors.New("conflict")
-	ErrPassNotActive     = errors.New("pass is not active")
-	ErrPassNotFrozen     = errors.New("pass is not frozen")
-	ErrAlreadyProcessed  = errors.New("already processed")
-	ErrVerifyCode        = errors.New("wrong sms verify code")
-	ErrMemberChangeNone  = errors.New("no member change quota left")
-	ErrDuplicateHolder   = errors.New("holder already owns an active pass")
-	ErrOffSale           = errors.New("pass type is off sale")
-	ErrDailyLimit        = errors.New("daily sales limit reached")
-	ErrQuotaInsufficient = errors.New("remaining quota insufficient")
+	ErrNotFound           = errors.New("resource not found")
+	ErrInvalidInput       = errors.New("invalid input")
+	ErrConflict           = errors.New("conflict")
+	ErrPassNotActive      = errors.New("pass is not active")
+	ErrPassNotFrozen      = errors.New("pass is not frozen")
+	ErrAlreadyProcessed   = errors.New("already processed")
+	ErrVerifyCode         = errors.New("wrong sms verify code")
+	ErrMemberChangeNone   = errors.New("no member change quota left")
+	ErrDuplicateHolder    = errors.New("holder already owns an active pass")
+	ErrOffSale            = errors.New("pass type is off sale")
+	ErrDailyLimit         = errors.New("daily sales limit reached")
+	ErrQuotaInsufficient  = errors.New("remaining quota insufficient")
+	ErrReviewNotPending   = errors.New("photo review task not awaiting submission")
+	ErrReviewNotSubmitted = errors.New("photo review task not submitted")
+	ErrReviewCheckMissing = errors.New("id certificate, guardianship and entry history must all be verified")
+	ErrReviewReasonEmpty  = errors.New("manual pass reason is required during photo review")
 )
 
 // Service 业务服务
@@ -80,6 +90,22 @@ func keyHighFreq(passID string) string          { return "hf:" + passID }
 func keyMultiLoc(passID string) string          { return "loc:" + passID }
 func keyManualReview(id string) string          { return "mreview:" + id }
 func keyVerifReview(verifID string) string      { return "verif:" + verifID + ":review" }
+
+// 儿童照片变化复核
+func keyPhotoReview(id string) string               { return "preview:" + id }
+func keyPhotoReviewList() string                    { return "preview:list" }
+func keyMemberOpenReview(memberID string) string    { return "member:" + memberID + ":open-preview" }
+func keyMemberLowScore(memberID string) string      { return "facelow:" + memberID }
+func keyMemberPhotoArchives(memberID string) string { return "member:" + memberID + ":archives" }
+func keyPhotoArchive(id string) string              { return "parchive:" + id }
+func keyPhotoCacheCurrent() string                  { return "photocache:current" }                    // SET，全部已生效照片版本 ID
+func keyPhotoCacheVersion(id string) string         { return "photocache:ver:" + id }                  // memberID -> PhotoCacheVersion
+func keyDevicePhotoPending(deviceID string) string  { return "device:" + deviceID + ":photo-pending" } // SET
+func keyDevicePhotoSynced(deviceID string) string   { return "device:" + deviceID + ":photo-synced" }  // SET
+func keyDeviceLastPull(deviceID string) string      { return "device:" + deviceID + ":last-pull" }
+func keyManualPass(id string) string                { return "mpass:" + id }
+func keyReviewManualPasses(taskID string) string    { return "preview:" + taskID + ":mpass" }
+func keyPassManualPasses(passID string) string      { return "pass:" + passID + ":mpass" }
 
 // ---------- 时间辅助 ----------
 func dateOf(t time.Time) string { return t.Format("2006-01-02") }

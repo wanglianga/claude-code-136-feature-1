@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>passgate API 文档</title>
+  <link rel="stylesheet" href="/docs/swagger-ui/swagger-ui.css" />
+  <style>
+    body { margin: 0; }
+    header { background:#1f2937; color:#fff; padding:10px 20px; font:14px/1.5 sans-serif; }
+  </style>
+</head>
+<body>
+  <header>passgate 景区年卡实名入园核验服务 — OpenAPI 文档（<a href="/docs/openapi.yaml">openapi.yaml</a>）</header>
+  <div id="swagger-ui"></div>
+  <script src="/docs/swagger-ui/swagger-ui-bundle.js" charset="UTF-8"></script>
+  <script src="/docs/swagger-ui/swagger-ui-standalone-preset.js" charset="UTF-8"></script>
+  <script>
+    window.onload = function () {
+      window.ui = SwaggerUIBundle({
+        url: "./openapi.yaml",
+        dom_id: "#swagger-ui",
+        deepLinking: true,
+        presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],
+        layout: "BaseLayout",
+        filter: true
+      });
+    };
+  </script>
+</body>
+</html>
